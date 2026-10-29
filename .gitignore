@@ -1,0 +1,34 @@
+# Python-generated files
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv/
+__pycache__/
+.streamlit/
+img/
+msg/    
+shp/
+sql/
+auth_info_baileys/
+Diagramado-Proyecto-Muniia.html
+partidos-pba*
+Muniia-Dashboard-Ux-Prototipo.html
+detener_MuniIA_old.bat
+iniciar_MuniIA_demo_old.bat
+.env
+dashboard.log
+procesador_python.log
+streamlit.log
+whatsapp_monitor.log
+package.json
+package-lock.json
+node_modules/
+whatsapp_inbox/
+scr/Crud_Subcategorias_V2.py
+scr/Validar_Nomenclador.py
+ejemplo.py
+monitor.pid
