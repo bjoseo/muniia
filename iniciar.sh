@@ -55,19 +55,11 @@ echo $PID > "$CDIR/monitor.pid"
 disown $PID 2>/dev/null || true
 echo "🟢 Monitor WhatsApp iniciado."
 
-
-#**********************
-
-
 # 1. Iniciar Procesador Python (con -u para desactivar buffering)
-nohup "$CDIR/.venv/bin/python" -u "$CDIR/procesar_inbox_v4.py" > "$CDIR/procesador_python.log" 2>&1 &
+nohup "$CDIR/.venv/bin/python" -u "$CDIR/procesar_inbox_v4.py" >> "$CDIR/procesador_python.log" 2>&1 < /dev/null &
 disown
-echo "🟢 Procesador Python iniciado."
 
-# 2. Iniciar Monitor de WhatsApp
-#nohup node "$CDIR/Monitor_Whatsapp_Baileys.js" > "$CDIR/whatsapp_monitor.log" 2>&1 &
-#disown
-#echo "🟢 Monitor WhatsApp iniciado."
+echo "🟢 Procesador Python iniciado."
 
 # 3. Iniciar Dashboard Streamlit
 nohup "$CDIR/.venv/bin/python" -u -m streamlit run "$CDIR/scr/dashboard.py" --server.port 8501 --server.headless true > "$CDIR/dashboard.log" 2>&1 &

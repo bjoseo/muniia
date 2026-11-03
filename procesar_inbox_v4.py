@@ -1,461 +1,552 @@
 """
-MuniIA - Dashboard Operativo v4.6
-Fixes: Borrado Transaccional Atómico, Mapeo Robusto PostGIS y Semáforo de Urgencia en Folium.
+Módulo de Procesamiento Automatizado de Inbox (WhatsApp a PostGIS).
+
+Este script monitorea la carpeta 'whatsapp_inbox', transcribe mensajes de audio
+mediante OpenAI Whisper, extrae datos de texto e imágenes, anonimiza al
+ciudadano mediante hashing SHA-256, clasifica el reclamo consultando la base
+de datos y guarda el registro junto con su trazabilidad en el historial.
+
+Cumple con especificaciones de codificación PEP 8 y buenas prácticas de auditoría.
 """
-import os
+
+import argparse
+import datetime
+import hashlib
 import json
+import os
+import re
+import sys
 import urllib.parse
 import urllib.request
-import warnings
-import streamlit as st
-import pandas as pd
-import psycopg2
 from pathlib import Path
+from typing import Dict, Any, Tuple, Optional
+from zoneinfo import ZoneInfo
+
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
 
-# Autorefresh para actualización en tiempo real
-try:
-    from streamlit_autorefresh import st_autorefresh
-    HAS_AUTOREFRESH = True
-except ImportError:
-    HAS_AUTOREFRESH = False
+# Cargar variables de entorno desde el archivo .env
+load_dotenv()
 
-# Cargar variables de entorno
-BASE_DIR = Path(__file__).resolve().parent.parent
-load_dotenv(BASE_DIR / ".env")
+# Configuración de Nominatim para Avellaneda
+AVELLANEDA_VIEWBOX = "-58.38,-34.72,-58.30,-34.64"
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+USER_AGENT = "MuniIA_MVP_Avellaneda/1.0 (14056411@ifts.edu.ar)"
 
-st.set_page_config(page_title="MuniIA - Centro de Control Operativo", layout="wide", page_icon="🏙️")
-
-# Desactivar refresco automático si el usuario está confirmando un borrado
-if HAS_AUTOREFRESH and not any(k.startswith("confirm_delete_") and v for k, v in st.session_state.items()):
-    st_autorefresh(interval=12000, limit=None, key="muniia_dashboard_autorefresh")
-
-try:
-    import folium
-    from streamlit_folium import st_folium
-    HAS_FOLIUM = True
-except ImportError:
-    HAS_FOLIUM = False
-
-INBOX_DIR = BASE_DIR / "whatsapp_inbox"
-PROCESADOS_DIR = INBOX_DIR / "procesados"
-
-DB_PASS = os.getenv("DB_PASS")
-if not DB_PASS:
-    st.error("❌ Error: La variable DB_PASS no está definida en el archivo .env")
-
-DB_CONFIG = {
-    "host": os.getenv("DB_HOST", "localhost"),
-    "port": os.getenv("DB_PORT", "5432"),
+# --- CONFIGURACIÓN DE CONEXIÓN A BASE DE DATOS ---
+DB_CONFIG: Dict[str, str] = {
     "dbname": os.getenv("DB_NAME", "muniia"),
     "user": os.getenv("DB_USER", "postgres"),
-    "password": DB_PASS,
+    "password": os.getenv("DB_PASS", "postgres"),
+    "host": os.getenv("DB_HOST", "localhost"),
+    "port": os.getenv("DB_PORT", "5432"),
 }
 
-BARRIOS_AVELLANEDA = [
-    "Avellaneda Centro", "Sarandí", "Villa Domínico", "Wilde",
-    "Gerli", "Piñeyro", "Dock Sud", "Crucecita"
-]
-
-def get_conn():
+# --- PARCHE DE COMPATIBILIDAD AUDIOOP / PYDUB ---
+try:
+    import audioop
+except ImportError:
     try:
-        return psycopg2.connect(**DB_CONFIG, connect_timeout=4)
-    except Exception as e:
-        print(f"Error conexión DB: {e}")
-        return None
+        import audioop_lts as audioop
+        sys.modules["audioop"] = audioop
+    except ImportError:
+        pass
 
-def re_geocodificar(direccion: str):
-    """Geocodifica la dirección ajustada usando Nominatim."""
-    if not direccion or len(direccion.strip()) < 3 or "a confirmar" in direccion.lower():
-        return None, None
-    
-    query_str = f"{direccion.strip()}, Avellaneda, Buenos Aires, Argentina"
-    url = f"https://nominatim.openstreetmap.org/search?{urllib.parse.urlencode({'q': query_str, 'format': 'jsonv2', 'limit': 1})}"
-    
-    headers = {
-        "User-Agent": "MuniIA_Municipal_App/2.0 (contacto_muniia@avellaneda.gob.ar)",
-        "Accept-Language": "es-AR,es;q=0.9"
+from pydub import AudioSegment
+import whisper
+
+
+def obtener_conexion() -> psycopg2.extensions.connection:
+    """Establece y retorna una conexión activa a PostgreSQL/PostGIS."""
+    try:
+        conn = psycopg2.connect(**DB_CONFIG)
+        return conn
+    except psycopg2.OperationalError as err:
+        print("\n❌ [ERROR GRAVE DE CONEXIÓN A BASE DE DATOS]")
+        print(f"   Detalle: {err}")
+        raise
+
+
+def get_barrio_postgis(conn: psycopg2.extensions.connection, lat: Optional[float], lon: Optional[float]) -> str:
+    """
+    Determina el barrio realizando una consulta espacial ST_Contains 
+    sobre la tabla 'barrios_avellaneda' en PostGIS.
+    """
+    if lat is None or lon is None:
+        return "Sarandí"  # Fallback predeterminado
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT nombre 
+                FROM barrios_avellaneda
+                WHERE ST_Contains(geom, ST_SetSRID(ST_MakePoint(%s, %s), 4326))
+                LIMIT 1
+            """, (lon, lat))
+            row = cur.fetchone()
+            if row and row[0]:
+                return row[0]
+            else:
+                return "Avellaneda Centro"
+    except Exception as e:
+        print(f"⚠️ [ERROR] Barrio PostGIS: {e}")
+        return "Sarandí"
+
+def geocodificar_nominatim(direccion_texto: str) -> Tuple[Optional[float], Optional[float], str]:
+    """
+    Geocodifica una dirección limpia en Nominatim (OSM) delimitado a Avellaneda.
+    Devuelve (lat, lon, precision).
+    """
+    if not direccion_texto or "a confirmar" in direccion_texto.lower():
+        return None, None, "Sin Geolocalizar"
+
+    query = f"{direccion_texto}, Avellaneda, Buenos Aires, Argentina"
+    params = {
+        "q": query,
+        "format": "json",
+        "bounded": 1,
+        "viewbox": AVELLANEDA_VIEWBOX,
+        "limit": 1,
+        "countrycodes": "ar",
+        "addressdetails": 1
     }
     
+    url = f"{NOMINATIM_URL}?{urllib.parse.urlencode(params)}"
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+
     try:
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            if data and len(data) > 0:
-                lat = float(data[0]["lat"])
-                lon = float(data[0]["lon"])
-                print(f"📍 Geocodificado OK: '{direccion}' -> Lat: {lat}, Lon: {lon}")
-                return lat, lon
+        with urllib.request.urlopen(req, timeout=5) as response:
+            if response.status == 200:
+                data = json.loads(response.read().decode("utf-8"))
+                if data:
+                    item = data[0]
+                    lat = float(item["lat"])
+                    lon = float(item["lon"])
+                    importance = float(item.get("importance", 0))
+                    
+                    precision = "Dirección con Altura" if importance >= 0.3 else "Aproximada"
+                    return lat, lon, precision
     except Exception as err:
-        print(f"⚠️ Error en geocodificación Nominatim para '{direccion}': {err}")
-        
-    return None, None
+        print(f"⚠️ Error al consultar Nominatim OSM: {err}")
 
-def load_catalogos():
-    conn = get_conn()
-    cats_dict, subcats_dict = {}, {}
-    if not conn: return cats_dict, subcats_dict
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT id_cat_general, nombre_general FROM categorias_generales ORDER BY nombre_general;")
-        for row in cur.fetchall():
-            cats_dict[row[1]] = row[0]
+    return None, None, "Sin Geolocalizar"
 
-        cur.execute("SELECT id_subcategoria, id_cat_general, nombre_subcategoria FROM subcategorias ORDER BY nombre_subcategoria;")
-        for row in cur.fetchall():
-            subcats_dict[row[2]] = {"id_sub": row[0], "id_cat": row[1]}
-        
-        cur.close()
-        conn.close()
-    except Exception:
-        if conn: conn.close()
-    return cats_dict, subcats_dict
 
-def load_reclamos():
-    """Carga los reclamos procesando coordenadas limpias de PostGIS o datos legacy."""
-    conn = get_conn()
-    if not conn: return pd.DataFrame()
-    query = """
-        SELECT 
-            r.id_reclamo,
-            COALESCE(r.codigo_seguimiento, 'SIN-CODIGO') as codigo_seguimiento,
-            r.fecha_ingreso as fecha,
-            r.texto_original,
-            r.texto_transcripto,
-            COALESCE(r.direccion_extraida, 'A confirmar') as direccion,
-            COALESCE(r.barrio_extraido, 'Avellaneda Centro') as barrio,
-            r.id_cat_general,
-            r.id_subcategoria,
-            COALESCE(cg.nombre_general, 'Sin Categorizar') as categoria,
-            COALESCE(sc.nombre_subcategoria, 'Sin Subcategoría') as subcategoria,
-            UPPER(COALESCE(r.urgencia, 'MEDIA')) as urgencia,
-            COALESCE(r.precision_geocoding, 'Sin Geolocalizar') as precision_geocoding,
-            CASE 
-                WHEN r.geom IS NOT NULL THEN ST_Y(r.geom)
-                WHEN r.lat IS NOT NULL AND r.lat != 0 THEN r.lat
-                ELSE NULL 
-            END as lat,
-            CASE 
-                WHEN r.geom IS NOT NULL THEN ST_X(r.geom)
-                WHEN r.lon IS NOT NULL AND r.lon != 0 THEN r.lon
-                ELSE NULL 
-            END as lon,
-            COALESCE(r.estado, 'PENDIENTE_REVISION') as estado,
-            r.url_audio, r.url_foto
-        FROM reclamos r
-        LEFT JOIN categorias_generales cg ON r.id_cat_general = cg.id_cat_general
-        LEFT JOIN subcategorias sc ON r.id_subcategoria = sc.id_subcategoria
-        ORDER BY r.fecha_ingreso DESC
+def extraer_geometria_y_barrio_gratuito(
+    conn: psycopg2.extensions.connection, 
+    texto: str
+) -> Tuple[str, str, float, float, str]:
     """
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", UserWarning)
-            df = pd.read_sql(query, conn)
-        conn.close()
-        
-        # Casting seguro de coordenadas
-        df['lat'] = pd.to_numeric(df['lat'], errors='coerce')
-        df['lon'] = pd.to_numeric(df['lon'], errors='coerce')
-        return df
-    except Exception as e:
-        print(f"Error cargando reclamos: {e}")
-        if conn: conn.close()
-        return pd.DataFrame()
-
-def actualizar_reclamo_operador(id_reclamo, estado_nuevo, direccion_nueva, barrio_nuevo, motivo_nuevo, id_cat, id_subcat):
-    conn = get_conn()
-    if not conn: return False
-    
-    lat, lon = re_geocodificar(direccion_nueva)
-    
-    try:
-        cur = conn.cursor()
-        if lat and lon:
-            cur.execute("""
-                UPDATE reclamos 
-                SET estado = %s, 
-                    direccion_extraida = %s, 
-                    barrio_extraido = %s,
-                    texto_transcripto = %s,
-                    id_cat_general = %s,
-                    id_subcategoria = %s,
-                    lat = %s, lon = %s, 
-                    geom = ST_SetSRID(ST_MakePoint(%s, %s), 4326),
-                    precision_geocoding = 'Validado Operador', 
-                    fecha_ultima_actualizacion = NOW()
-                WHERE id_reclamo = %s
-            """, (estado_nuevo, direccion_nueva, barrio_nuevo, motivo_nuevo, id_cat, id_subcat, lat, lon, lon, lat, id_reclamo))
-        else:
-            cur.execute("""
-                UPDATE reclamos 
-                SET estado = %s, 
-                    direccion_extraida = %s, 
-                    barrio_extraido = %s,
-                    texto_transcripto = %s,
-                    id_cat_general = %s,
-                    id_subcategoria = %s,
-                    fecha_ultima_actualizacion = NOW()
-                WHERE id_reclamo = %s
-            """, (estado_nuevo, direccion_nueva, barrio_nuevo, motivo_nuevo, id_cat, id_subcat, id_reclamo))
-
-        cur.execute("""
-            INSERT INTO historial_estados (id_reclamo, estado_anterior, estado_nuevo, fecha_cambio, responsable, comentario)
-            VALUES (%s, 'PENDIENTE_REVISION', %s, NOW(), 'Operador Dashboard', %s)
-        """, (id_reclamo, estado_nuevo, f"Validación manual: {direccion_nueva}"))
-
-        conn.commit()
-        cur.close()
-        conn.close()
-        return True
-    except Exception as e:
-        print(f"❌ Error actualizando reclamo: {e}")
-        if conn: conn.rollback(); conn.close()
-        return False
-
-def eliminar_reclamo_transaccional(id_reclamo, operador, motivo_baja):
-    """Ejecuta borrado en cascada y respaldo de auditoría en PostgreSQL."""
-    conn = get_conn()
-    if not conn: return False
-    
-    sql_crear_tabla = """
-        CREATE TABLE IF NOT EXISTS public.reclamos_eliminados (
-            id_eliminado SERIAL PRIMARY KEY,
-            id_reclamo INT,
-            codigo_seguimiento VARCHAR(50),
-            remoto_jid VARCHAR(100),
-            texto_original TEXT,
-            motivo_eliminacion TEXT,
-            operador VARCHAR(100),
-            fecha_eliminacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            datos_completos_json JSONB
-        );
+    Extrae estrictamente [Nombre de Calle] + [Altura], geocodifica vía OSM 
+    y resuelve el barrio espacialmente vía PostGIS ST_Contains.
     """
-    sql_copiar = """
-        INSERT INTO public.reclamos_eliminados (id_reclamo, codigo_seguimiento, remoto_jid, texto_original, motivo_eliminacion, operador, datos_completos_json)
-        SELECT id_reclamo, codigo_seguimiento, remoto_jid, texto_original, %s, %s, row_to_json(r)
-        FROM public.reclamos r
-        WHERE id_reclamo = %s;
-    """
-    sql_borrar_historial = "DELETE FROM public.historial_estados WHERE id_reclamo = %s;"
-    sql_borrar_reclamo = "DELETE FROM public.reclamos WHERE id_reclamo = %s;"
+    direccion_limpia = "Avellaneda (Dirección a confirmar)"
+    lat, lon = -34.6865, -58.3486  # Centroide por defecto
+    precision = "Sin Geolocalizar"
 
-    try:
-        cur = conn.cursor()
-        cur.execute(sql_crear_tabla)
-        cur.execute(sql_copiar, (motivo_baja, operador, id_reclamo))
-        cur.execute(sql_borrar_historial, (id_reclamo,))
-        cur.execute(sql_borrar_reclamo, (id_reclamo,))
-        conn.commit()
-        cur.close()
-        conn.close()
-        return True
-    except Exception as e:
-        print(f"❌ Error borrando reclamo {id_reclamo}: {e}")
-        if conn: conn.rollback(); conn.close()
-        return False
+    if not texto or len(texto.strip()) < 5:
+        barrio_detectado = get_barrio_postgis(conn, lat, lon)
+        return direccion_limpia, barrio_detectado, lat, lon, precision
 
-# --- SIDEBAR DE FILTROS ---
-st.sidebar.title("🏙️ MuniIA Avellaneda")
-st.sidebar.markdown("---")
+    # 1. Palabras de relleno comunes en reclamos de WhatsApp a remover del nombre de la calle
+    stopwords_reclamo = [
+        "buenas", "noches", "tardes", "dias", "hola", "hay", "un", "una", "el", "la", 
+        "los", "las", "contenedor", "fuego", "arbol", "árbol", "vereda", "caido", "caído", 
+        "prendido", "peligro", "por", "tormenta", "rota", "roto", "de", "en", "calle", 
+        "av", "avenida", "al", "que", "hizo", "para", "hacer", "reclamo", "luz", "mercurio",
+        "reparacion", "reparación", "reportar", "es", "una"
+    ]
 
-df_raw = load_reclamos()
-cats_dict, subcats_dict = load_catalogos()
+    # 2. Capturar patrón de calle + número (ejemplo: "... en la calle Mitre al 2000 ...")
+    match = re.search(r"([a-zA-ZáéíóúñÁÉÍÓÚÑ\s]{3,35})\s+(?:al\s+)?(\d{2,5})", texto, re.IGNORECASE)
 
-if not df_raw.empty:
-    barrio_sel = st.sidebar.selectbox("Filtrar por Barrio", ["Todos"] + list(df_raw["barrio"].dropna().unique()))
-    estado_sel = st.sidebar.selectbox("Filtrar por Estado", ["Todos"] + list(df_raw["estado"].dropna().unique()))
+    if match:
+        calle_candidata = match.group(1).strip()
+        altura = match.group(2).strip()
 
-    df = df_raw.copy()
-    if barrio_sel != "Todos": df = df[df["barrio"] == barrio_sel]
-    if estado_sel != "Todos": df = df[df["estado"] == estado_sel]
-else:
-    df = df_raw
+        # Filtrar palabras de relleno para conservar sólo el nombre propio de la calle
+        palabras_calle = [
+            p.title() for p in calle_candidata.split() 
+            if p.lower() not in stopwords_reclamo
+        ]
 
-st.title("📌 Centro de Control Operativo · Reclamos Urbanos")
-st.caption("Municipio de Avellaneda | Conectado a PostGIS")
+        if palabras_calle:
+            calle_nombre = " ".join(palabras_calle)
+            direccion_limpia = f"{calle_nombre} {altura}"
 
-# METRICAS KPI
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Total Reclamos", len(df_raw))
-pend = len(df_raw[df_raw['estado'] == 'PENDIENTE_REVISION']) if not df_raw.empty else 0
-c2.metric("Pendientes Revisión", pend)
-ing = len(df_raw[df_raw['estado'] == 'INGRESADO']) if not df_raw.empty else 0
-c3.metric("Ingresados / En Curso", ing)
-res = len(df_raw[df_raw['estado'] == 'RESUELTO']) if not df_raw.empty else 0
-c4.metric("Resueltos", res)
+            # 3. Intentar geocodificar Dirección + Altura en Nominatim
+            lat_osm, lon_osm, prec_osm = geocodificar_nominatim(direccion_limpia)
 
-st.markdown("---")
-
-tab_mapa, tab_revision, tab_tabla, tab_inbox = st.tabs([
-    "🗺️ Mapa Interactivo", "🚨 Bandeja de Revisión", "📋 Tabla General", "📊 Telemetría Inbox"
-])
-
-with tab_mapa:
-    if df.empty:
-        st.info("Sin datos para mostrar.")
-    elif HAS_FOLIUM:
-        m = folium.Map(location=[-34.6865, -58.3486], zoom_start=13, tiles="OpenStreetMap")
-        
-        # Leyenda visual de colores por urgencia
-        st.caption("🔴 **Alta/Crítica** | 🟠 **Media** | 🟢 **Baja** | 🟡 **Pendiente Revisión**")
-        
-        marcadores_agregados = 0
-        for _, row in df.iterrows():
-            if pd.isna(row['lat']) or pd.isna(row['lon']): continue
-            
-            # Asignación de color según nivel de urgencia y estado
-            urg = str(row['urgencia']).upper()
-            if row['estado'] == 'PENDIENTE_REVISION':
-                color_pin = "orange"
-            elif urg in ["ALTA", "CRITICA", "URGENTE"]:
-                color_pin = "red"
-            elif urg == "BAJA":
-                color_pin = "green"
+            if lat_osm and lon_osm:
+                lat, lon = lat_osm, lon_osm
+                precision = prec_osm
             else:
-                color_pin = "blue" # MEDIA por defecto
-            
-            popup_html = f"""
-            <b>Código:</b> {row['codigo_seguimiento']}<br>
-            <b>Urgencia:</b> {row['urgencia']}<br>
-            <b>Dirección:</b> {row['direccion']}<br>
-            <b>Barrio:</b> {row['barrio']}<br>
-            <b>Estado:</b> {row['estado']}
-            """
-            
-            folium.Marker(
-                location=[float(row['lat']), float(row['lon'])],
-                popup=popup_html,
-                tooltip=f"{row['codigo_seguimiento']} ({row['urgencia']})",
-                icon=folium.Icon(color=color_pin, icon="info-sign")
-            ).add_to(m)
-            marcadores_agregados += 1
-            
-        st_folium(m, width=None, height=500, returned_objects=[])
-        if marcadores_agregados == 0:
-            st.warning("⚠️ Hay reclamos registrados pero ninguno posee coordenadas geográficas válidas aún.")
+                # Fallback: intentar solo con la calle si la altura exacta falla en OSM
+                lat_calle, lon_calle, _ = geocodificar_nominatim(calle_nombre)
+                if lat_calle and lon_calle:
+                    lat, lon = lat_calle, lon_calle
+                    precision = "Aproximada"
 
-with tab_revision:
-    st.markdown("### 🚨 Reclamos Pendientes de Revisión")
-    df_pendientes = df_raw[df_raw['estado'] == 'PENDIENTE_REVISION']
+    # 4. Asignación espacial del barrio exacto usando PostGIS ST_Contains
+    barrio_detectado = get_barrio_postgis(conn, lat, lon)
+
+    return direccion_limpia, barrio_detectado, lat, lon, precision
+
+def obtener_o_crear_ciudadano_hash(
+    conn: psycopg2.extensions.connection,
+    telefono_o_id: Optional[str],
+    barrio: str = "Sarandí"
+) -> str:
+    """Genera hash SHA-256 del teléfono para anonimizar la identidad del vecino."""
+    tz_arg = ZoneInfo("America/Argentina/Buenos_Aires")
+    fecha_ahora = datetime.datetime.now(tz_arg)
+    if not telefono_o_id:
+        telefono_o_id = "anonimo_whatsapp"
+
+    hash_ciudadano = hashlib.sha256(telefono_o_id.encode("utf-8")).hexdigest()[:16]
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT cantidad_reclamos FROM ciudadanos_anonimizados WHERE id_ciudadano_hash = %s",
+            (hash_ciudadano,)
+        )
+        row = cur.fetchone()
+
+        if row:
+            cur.execute(
+                """
+                UPDATE ciudadanos_anonimizados 
+                SET cantidad_reclamos = cantidad_reclamos + 1,
+                    barrio_inferido = COALESCE(%s, barrio_inferido)
+                WHERE id_ciudadano_hash = %s
+                """,
+                (barrio, hash_ciudadano)
+            )
+        else:
+            cur.execute(
+                """
+                INSERT INTO ciudadanos_anonimizados (
+                    id_ciudadano_hash, barrio_inferido, primera_interaccion, cantidad_reclamos
+                ) VALUES (%s, %s, %s, %s)
+                """,
+                (hash_ciudadano, barrio, fecha_ahora, 1)
+            )
+
+    return hash_ciudadano
+
+
+def clasificar_y_obtener_metadatos(
+    conn: psycopg2.extensions.connection,
+    texto: Optional[str]
+) -> Tuple[Optional[int], Optional[int], str, Optional[int]]:
+    """
+    Clasifica el texto consultando 'subcategorias' y 'categorias_generales'.
+    Devuelve: (id_cat_general, id_subcategoria, urgencia_default, id_area_default)
+    """
+    if not texto or len(texto.strip()) < 3:
+        return None, None, "MEDIA", None
+
+    texto_lower = texto.lower()
+
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT 
+                    s.id_subcategoria, 
+                    s.id_cat_general, 
+                    s.nombre_subcategoria, 
+                    s.urgencia_default,
+                    c.id_area_default
+                FROM subcategorias s
+                JOIN categorias_generales c ON s.id_cat_general = c.id_cat_general
+                """
+            )
+            subcategorias = cur.fetchall()
+
+            for sub in subcategorias:
+                nombre_sub = sub["nombre_subcategoria"].lower()
+                palabras = [p for p in re.split(r"\W+", nombre_sub) if len(p) > 3]
+                if any(p in texto_lower for p in palabras if p not in ["para", "como", "esta"]):
+                    urgencia = sub["urgencia_default"] if sub["urgencia_default"] else "MEDIA"
+                    return (
+                        sub["id_cat_general"],
+                        sub["id_subcategoria"],
+                        urgencia.upper(),
+                        sub["id_area_default"]
+                    )
+
+            # Heurísticas de respaldo si la coincidencia exacta de palabras clave falla
+            for sub in subcategorias:
+                nom = sub["nombre_subcategoria"].lower()
+                if any(k in texto_lower for k in ["basura", "contenedor", "fuego", "desbordada"]):
+                    if any(k in nom for k in ["basura", "contenedor", "residuos"]):
+                        return sub["id_cat_general"], sub["id_subcategoria"], (sub["urgencia_default"] or "MEDIA").upper(), sub["id_area_default"]
+                elif any(k in texto_lower for k in ["luz", "mercurio", "lampara", "luminaria", "apagada"]):
+                    if any(k in nom for k in ["luminaria", "alumbrado", "luz"]):
+                        return sub["id_cat_general"], sub["id_subcategoria"], (sub["urgencia_default"] or "MEDIA").upper(), sub["id_area_default"]
+                elif any(k in texto_lower for k in ["árbol", "arbol", "rama", "poda", "caída", "caido"]):
+                    if any(k in nom for k in ["arbol", "poda", "caída", "caida"]):
+                        return sub["id_cat_general"], sub["id_subcategoria"], (sub["urgencia_default"] or "MEDIA").upper(), sub["id_area_default"]
+
+    except Exception as err:
+        print(f"⚠️ Error durante la clasificación desde BD: {err}")
+
+    return None, None, "MEDIA", None
+
+def guardar_reclamo_completo(
+    conn: psycopg2.extensions.connection,
+    datos: Dict[str, Any]
+) -> None:
+    """Registra atómicamente el reclamo en 'reclamos' e 'historial_estados'."""
     
-    if df_pendientes.empty:
-        st.success("🎉 ¡No hay reclamos pendientes de revisión!")
-    else:
-        for _, row in df_pendientes.iterrows():
-            rec_id = row['id_reclamo']
-            st.markdown(f"#### Reclamo: `{row['codigo_seguimiento']}`")
-            
-            with st.container():
-                c_inf, c_med, c_act = st.columns([3, 2, 3])
-                
-                with c_inf:
-                    st.markdown("**Multimedia / Mensaje Original:**")
-                    texto_actual = row['texto_transcripto'] or row['texto_original'] or ""
-                    motivo_editado = st.text_area("Motivo / Descripción del Reclamo", value=texto_actual, key=f"motivo_{rec_id}", height=100)
-                
-                with c_med:
-                    url_audio = row.get('url_audio')
-                    if pd.notna(url_audio) and str(url_audio).strip():
-                        a_path = PROCESADOS_DIR / str(url_audio)
-                        if a_path.exists(): st.audio(str(a_path))
-                    
-                    url_foto = row.get('url_foto')
-                    if pd.notna(url_foto) and str(url_foto).strip():
-                        i_path = PROCESADOS_DIR / str(url_foto)
-                        if i_path.exists(): st.image(str(i_path), width='stretch')
+    # Obtener la hora actual en zona horaria Argentina y quitar el offset implícito
+    tz_arg = ZoneInfo("America/Argentina/Buenos_Aires")
+    fecha_ahora = datetime.datetime.now(tz_arg).replace(tzinfo=None)
 
-                with c_act:
-                    nueva_dir = st.text_input("Dirección Corregida", value=row['direccion'], key=f"dir_{rec_id}")
-                    
-                    idx_barrio = BARRIOS_AVELLANEDA.index(row['barrio']) if row['barrio'] in BARRIOS_AVELLANEDA else 0
-                    nuevo_barrio = st.selectbox("Barrio", BARRIOS_AVELLANEDA, index=idx_barrio, key=f"barrio_{rec_id}")
-                    
-                    lista_cats = list(cats_dict.keys()) if cats_dict else ["Sin Categorizar"]
-                    cat_sel = st.selectbox("Categoría General", lista_cats, key=f"cat_{rec_id}")
-                    
-                    id_cat_elegida = cats_dict.get(cat_sel)
-                    lista_subcats = [s for s, info in subcats_dict.items() if info["id_cat"] == id_cat_elegida] if id_cat_elegida else ["Sin Subcategoría"]
-                    if not lista_subcats: lista_subcats = ["Sin Subcategoría"]
-                    
-                    subcat_sel = st.selectbox("Subcategoría", lista_subcats, key=f"subcat_{rec_id}")
-                    id_subcat_elegida = subcats_dict.get(subcat_sel, {}).get("id_sub")
+    import uuid
+    id_reclamo = str(uuid.uuid4())
+    codigo_seguimiento = f"WAP-{fecha_ahora.strftime('%Y%m%d')}-{id_reclamo[:4].upper()}"
 
-                    col_btn1, col_btn2 = st.columns(2)
-                    with col_btn1:
-                        if st.button("✅ Validar y Enviar", type="primary", key=f"btn_validar_{rec_id}"):
-                            if actualizar_reclamo_operador(rec_id, "INGRESADO", nueva_dir, nuevo_barrio, motivo_editado, id_cat_elegida, id_subcat_elegida):
-                                st.success("Reclamo validado y geocodificado con éxito.")
-                                st.rerun()
+    # Barrio resuelto dinámicamente con PostGIS
+    barrio_real = datos.get("barrio_extraido") or get_barrio_postgis(conn, datos.get("lat"), datos.get("lon"))
 
-                    with col_btn2:
-                        if st.button("🗑️ Eliminar Reclamo", key=f"btn_del_init_{rec_id}"):
-                            st.session_state[f"confirm_delete_{rec_id}"] = True
-                            st.rerun()
-
-            # Confirmación de borrado
-            if st.session_state.get(f"confirm_delete_{rec_id}", False):
-                st.warning(f"⚠️ **¿Confirmas la eliminación del reclamo `{row['codigo_seguimiento']}`?**")
-                motivo_baja = st.text_input("Motivo de baja / desestimación", value="Duplicado / Desestimado", key=f"txt_baja_{rec_id}")
-                
-                c_si, c_no = st.columns([1, 4])
-                with c_si:
-                    if st.button("Confirmar Borrado", type="primary", key=f"btn_del_yes_{rec_id}"):
-                        if eliminar_reclamo_transaccional(rec_id, "Operador Dashboard", motivo_baja):
-                            st.session_state[f"confirm_delete_{rec_id}"] = False
-                            st.success("Reclamo auditado y borrado correctamente.")
-                            st.rerun()
-                with c_no:
-                    if st.button("Cancelar", key=f"btn_del_no_{rec_id}"):
-                        st.session_state[f"confirm_delete_{rec_id}"] = False
-                        st.rerun()
-
-            st.markdown("---")
-
-with tab_tabla:
-    st.dataframe(
-        df[["codigo_seguimiento", "fecha", "urgencia", "categoria", "subcategoria", "texto_transcripto", "direccion", "barrio", "estado"]], 
-        width='stretch'
+    hash_ciudadano = obtener_o_crear_ciudadano_hash(
+        conn,
+        telefono_o_id=datos.get("remitente_telefono"),
+        barrio=barrio_real
     )
 
-with tab_inbox:
-    st.markdown("### 📊 Telemetría de Servicios e Ingesta")
-    conn_tel = get_conn()
-    if conn_tel:
-        try:
-            cur = conn_tel.cursor()
-            cur.execute("SELECT COUNT(*) FROM reclamos;")
-            total_db = cur.fetchone()[0]
-            
-            cur.execute("SELECT COUNT(*) FROM reclamos WHERE url_audio IS NOT NULL;")
-            total_audios = cur.fetchone()[0]
-            
-            cur.execute("SELECT COUNT(*) FROM reclamos WHERE url_foto IS NOT NULL;")
-            total_fotos = cur.fetchone()[0]
-            
-            total_textos = total_db - (total_audios + total_fotos)
-            
-            cur.execute("SELECT COUNT(*) FROM reclamos_eliminados;")
-            total_eliminados = cur.fetchone()[0]
-            
-            cur.close()
-            conn_tel.close()
+    texto_evaluar = datos.get("texto_transcripto") or datos.get("texto_original") or ""
+    id_cat_general, id_subcategoria, urgencia_bd, id_area_default = clasificar_y_obtener_metadatos(conn, texto_evaluar)
 
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Total Ingresados en BD", total_db)
-            m2.metric("Audios Procesados (Whisper)", total_audios)
-            m3.metric("Imágenes Recibidas", total_fotos)
-            m4.metric("Reclamos Auditados / Desestimados", total_eliminados)
-
-            st.markdown("---")
-            st.markdown("#### 📈 Desglose por Formato de Entrada")
-            df_formatos = pd.DataFrame({
-                "Origen": ["Texto Directo", "Audio (Whisper)", "Imagen"],
-                "Cantidad": [total_textos, total_audios, total_fotos]
-            })
-            st.dataframe(df_formatos, width='stretch')
-
-        except Exception as e:
-            st.error(f"Error al obtener métricas de telemetría: {e}")
-            if conn_tel: conn_tel.close()
+    direccion = datos.get("direccion_extraida")
+    es_direccion_valida = direccion and "a confirmar" not in direccion.lower()
+    
+    if id_cat_general and id_subcategoria and es_direccion_valida:
+        estado_reclamo = "INGRESADO"
+        id_area_asignada = id_area_default
+        comentario_historial = f"Reclamo asignado automáticamente a área ID {id_area_asignada}."
     else:
-        st.warning("No se pudo conectar a la base de datos para cargar telemetría.")
+        estado_reclamo = "PENDIENTE_REVISION"
+        id_area_asignada = None
+        comentario_historial = "Reclamo derivado a revisión manual por datos incompletos o baja confianza."
+
+    geom_sql = (
+        f"ST_SetSRID(ST_MakePoint({datos['lon']}, {datos['lat']}), 4326)"
+        if datos.get("lat") and datos.get("lon")
+        else "NULL"
+    )
+
+    sql_reclamo = f"""
+        INSERT INTO reclamos (
+            id_reclamo, codigo_seguimiento, id_ciudadano_hash, id_canal,
+            id_cat_general, id_subcategoria, id_area_asignada, texto_original, texto_transcripto,
+            url_audio, url_foto, direccion_extraida, barrio_extraido,
+            urgencia, confianza_clasificacion, confianza_subcategoria,
+            precision_geocoding, geom, lat, lon, fecha_ingreso,
+            fecha_ultima_actualizacion, estado
+        ) VALUES (
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+            {geom_sql}, %s, %s, %s, %s, %s
+        )
+    """
+
+    urgencia_normalizada = (urgencia_bd or "MEDIA").upper()
+
+    params_reclamo = (
+        id_reclamo,
+        codigo_seguimiento,
+        hash_ciudadano,
+        1,  # Canal WhatsApp
+        id_cat_general,
+        id_subcategoria,
+        id_area_asignada,
+        datos.get("texto_original"),
+        datos.get("texto_transcripto"),
+        datos.get("url_audio"),
+        datos.get("url_foto"),
+        direccion,
+        barrio_real,
+        urgencia_normalizada,
+        datos.get("confianza_clasificacion", 0.85 if id_cat_general else 0.40),
+        datos.get("confianza_subcategoria", 0.85 if id_subcategoria else 0.40),
+        datos.get("precision_geocoding", "Sin Geolocalizar"),
+        datos.get("lat"),
+        datos.get("lon"),
+        fecha_ahora,
+        fecha_ahora,
+        estado_reclamo
+    )
+
+    sql_historial = """
+        INSERT INTO historial_estados (
+            id_reclamo, estado_anterior, estado_nuevo, fecha_cambio, responsable, comentario
+        ) VALUES (%s, %s, %s, %s, %s, %s)
+    """
+
+    params_historial = (
+        id_reclamo,
+        None,
+        estado_reclamo,
+        fecha_ahora,
+        "Sistema Automatizado WhatsApp",
+        f"Código {codigo_seguimiento}: {comentario_historial}"
+    )
+
+    with conn.cursor() as cur:
+        cur.execute(sql_reclamo, params_reclamo)
+        cur.execute(sql_historial, params_historial)
+
+    conn.commit()
+    print(f"  ✅ Reclamo {codigo_seguimiento} [{estado_reclamo}] en barrio '{barrio_real}' guardado a las {fecha_ahora.strftime('%H:%M:%S')}.")
+
+def procesar_inbox(directorio_inbox: str) -> None:
+    """Orquesta el procesamiento iterativo de archivos recibidos."""
+    inbox_path = Path(directorio_inbox)
+    procesados_path = inbox_path / "procesados"
+    procesados_path.mkdir(exist_ok=True)
+
+    if not inbox_path.exists():
+        print(f"❌ La carpeta '{directorio_inbox}' no existe.")
+        return
+
+    print("🔌 Verificando conexión a PostgreSQL/PostGIS...")
+    conn = obtener_conexion()
+    print("  -> Conexión a BD establecida correctamente.")
+
+    print("🎙️ Cargando modelo Whisper ('small')...")
+    model_whisper = whisper.load_model("small")
+
+    archivos = [f for f in inbox_path.iterdir() if f.is_file()]
+    print(f"📂 Archivos pendientes a procesar: {len(archivos)}")
+
+    for archivo in archivos:
+        ext = archivo.suffix.lower()
+        nombre_base = archivo.stem
+
+        if ext == ".txt" and (inbox_path / f"{nombre_base}.jpg").exists():
+            continue
+
+        remitente_tel = (
+            nombre_base.split("_")[0]
+            if "_" in nombre_base and nombre_base.split("_")[0].isdigit()
+            else "whatsapp_user"
+        )
+
+        datos: Dict[str, Any] = {
+            "remitente_telefono": remitente_tel,
+            "url_audio": None,
+            "url_foto": None,
+            "texto_original": None,
+            "texto_transcripto": None
+        }
+
+        try:
+            # 1. MENSAJES DE AUDIO
+            if ext in [".ogg", ".mp3", ".wav", ".m4a", ".oga"]:
+                print(f"\n=== Procesando Audio: {archivo.name} ===")
+                res = model_whisper.transcribe(str(archivo))
+                transcripcion = res.get("text", "").strip()
+                print(f"  -> Transcripción: {transcripcion}")
+
+                dir_ext, barrio_ext, lat, lon, prec = extraer_geometria_y_barrio_gratuito(conn, transcripcion)
+                datos.update({
+                    "url_audio": archivo.name,
+                    "texto_original": "[Mensaje de voz de WhatsApp]",
+                    "texto_transcripto": transcripcion,
+                    "direccion_extraida": dir_ext,
+                    "barrio_extraido": barrio_ext,
+                    "lat": lat,
+                    "lon": lon,
+                    "precision_geocoding": prec
+                })
+
+            # 2. MENSAJES DE TEXTO PURO (.txt)
+            elif ext == ".txt":
+                print(f"\n=== Procesando Texto: {archivo.name} ===")
+                with open(archivo, "r", encoding="utf-8") as f:
+                    contenido = f.read().strip()
+
+                dir_ext, barrio_ext, lat, lon, prec = extraer_geometria_y_barrio_gratuito(conn, contenido)
+                datos.update({
+                    "texto_original": contenido,
+                    "texto_transcripto": None,
+                    "direccion_extraida": dir_ext,
+                    "barrio_extraido": barrio_ext,
+                    "lat": lat,
+                    "lon": lon,
+                    "precision_geocoding": prec
+                })
+
+            # 3. IMÁGENES (.jpg, .jpeg, .png, .webp)
+            elif ext in [".jpg", ".jpeg", ".png", ".webp"]:
+                print(f"\n=== Procesando Imagen: {archivo.name} ===")
+                txt_asociado = archivo.with_suffix(".txt")
+                txt_contenido = ""
+                
+                if txt_asociado.exists():
+                    with open(txt_asociado, "r", encoding="utf-8") as f:
+                        txt_contenido = f.read().strip()
+                    txt_asociado.rename(procesados_path / txt_asociado.name)
+
+                if txt_contenido:
+                    dir_ext, barrio_ext, lat, lon, prec = extraer_geometria_y_barrio_gratuito(conn, txt_contenido)
+                else:
+                    dir_ext, barrio_ext, lat, lon, prec = "Avellaneda (Foto adjunta)", "Sarandí", -34.6865, -58.3486, "Pendiente Imagen"
+
+                datos.update({
+                    "url_foto": archivo.name,
+                    "texto_original": txt_contenido if txt_contenido else "[Imagen adjunta enviada vía WhatsApp]",
+                    "texto_transcripto": None,
+                    "direccion_extraida": dir_ext,
+                    "barrio_extraido": barrio_ext,
+                    "lat": lat,
+                    "lon": lon,
+                    "precision_geocoding": prec
+                })
+
+            else:
+                continue
+
+            guardar_reclamo_completo(conn, datos)
+            archivo.rename(procesados_path / archivo.name)
+
+        except Exception as err:
+            print(f"❌ Error procesando {archivo.name}: {err}")
+            conn.rollback()
+
+    conn.close()
+    print("\n[OK] Inbox procesado e integrado exitosamente con PostGIS.")
+
+
+
+def procesar_inbox_daemon(directorio_inbox: str = "whatsapp_inbox"):
+    inbox_path = Path(directorio_inbox)
+    print("🚀 [MuniIA Worker] Iniciando monitoreo continuo...")
+    conn = obtener_conexion()
+    model_whisper = whisper.load_model("small")
+    while True:
+        try:
+            # Reusa la lógica de procesar_inbox pero sin cerrar conexión
+            archivos = [f for f in inbox_path.iterdir() if f.is_file() and not f.name.endswith('.tmp')]
+            for archivo in archivos:
+                # ... toda tu lógica de audio/texto/imagen + guardar_reclamo_completo ...
+                parser = argparse.ArgumentParser(description="Procesador de Inbox WhatsApp a PostGIS")
+                parser.add_argument("--input", default="whatsapp_inbox", help="Carpeta de entrada")
+                args = parser.parse_args()
+
+                procesar_inbox(args.input)
+                pass
+        except Exception as err:
+            print(f"❌ Loop Error: {err}")
+#        datetime.time.sleep(5)
+
+if __name__ == "__main__":
+#    parser = argparse.ArgumentParser(description="Procesador de Inbox WhatsApp a PostGIS")
+#    parser.add_argument("--input", default="whatsapp_inbox", help="Carpeta de entrada")
+#    args = parser.parse_args()
+
+    procesar_inbox_daemon()
+#    print("\n[OK] Listo. Refresca dashboard en http://localhost:8501")
