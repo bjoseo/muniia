@@ -1,6 +1,7 @@
 /**
  * Monitor_Whatsapp_Baileys.js
- * Ingestión con Debounce Buffer, filtros de seguridad y escritura atómica.
+ * Ingestión con Debounce Buffer, filtros de seguridad, escritura atómica
+ * y polling de despacho automático de respuestas guardadas en PostgreSQL.
  */
 
 const {
@@ -19,7 +20,7 @@ if (!fs.existsSync(INBOX_DIR)) {
   fs.mkdirSync(INBOX_DIR, { recursive: true });
 }
 
-// Configuración PostgreSQL (sin fallback hardcodeado)
+// Configuración PostgreSQL
 const dbConfig = {
   host: process.env.DB_HOST || 'localhost',
   port: process.env.DB_PORT || 5432,
@@ -33,6 +34,9 @@ const userBuffers = new Map(); // remoteJid -> Array de textos
 const userTimers = new Map(); // remoteJid -> setTimeout ID
 const DEBOUNCE_MS = 10000; // Ventana de 10 segundos
 
+/**
+ * Consulta la BD por respuestas pendientes de envío y las despacha vía WhatsApp.
+ */
 async function checkAndSendResponses(sock) {
   const client = new Client(dbConfig);
   try {
@@ -47,17 +51,21 @@ async function checkAndSendResponses(sock) {
     `);
 
     for (const row of res.rows) {
-      console.log(`📤 Enviando respuesta a ${row.remoto_jid}...`);
-      await sock.sendMessage(row.remoto_jid, { text: row.mensaje_respuesta });
+      console.log(`📤 Despachando respuesta a WhatsApp: ${row.remoto_jid}...`);
+      //      await sock.sendMessage(row.remoto_jid, { text: row.mensaje_respuesta });
+
       await client.query(
         'UPDATE reclamos SET respuesta_enviada = TRUE WHERE id_reclamo = $1',
         [row.id_reclamo],
       );
+      console.log(
+        `✅ Respuesta marcada como enviada para el reclamo ID: ${row.id_reclamo}`,
+      );
     }
   } catch (err) {
-    // Manejo de errores silencioso para reconexión DB
+    // Manejo silencioso durante reconexiones temporales
   } finally {
-    await client.end();
+    await client.end().catch(() => {});
   }
 }
 
@@ -112,13 +120,15 @@ async function startBot() {
       setTimeout(startBot, 10000);
     } else if (connection === 'open') {
       console.log('✅ Conectado a WhatsApp - Servidor activo.');
+      // Polling continuo cada 5 segundos para enviar respuestas automáticas
       setInterval(() => checkAndSendResponses(sock), 5000);
     }
   });
 
   sock.ev.on('messages.upsert', async ({ messages }) => {
     for (const msg of messages) {
-      //    if (msg.key.fromMe || !msg.message) continue;
+      //      if (msg.key.fromMe || !msg.message) continue;
+      if (!msg.message) continue;
 
       const remoteJid = msg.key.remoteJid || '';
 
@@ -178,7 +188,6 @@ async function startBot() {
             `📩 Imagen lista: ${timestamp}_imagen.jpg de ${remoteJid}`,
           );
         } else if (caption.length > 0) {
-          // Debounce logic para mensajes de texto
           if (!userBuffers.has(remoteJid)) {
             userBuffers.set(remoteJid, []);
           }

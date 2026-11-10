@@ -1,6 +1,6 @@
 """
-MuniIA - Dashboard Operativo v4.7
-Incorporate: Edición de Reclamos Ingresados y CRUD Administrativo de Subcategorías / Palabras Clave.
+MuniIA - Dashboard Operativo v4.8
+Incorporate: Edición de Reclamos Ingresados, Feed Multimedia Integrado y CRUD Administrativo.
 """
 import os
 import json
@@ -91,33 +91,63 @@ def re_geocodificar(direccion: str):
     return None, None
 
 def load_catalogos():
-    """Carga categorías y subcategorías completas incluyendo palabras clave."""
+    """Carga categorías y subcategorías completas convirtiendo explícitamente los IDs a int e independizando alias de columna."""
     conn = get_conn()
-    cats_dict, subcats_dict = {}, {}
-    if not conn: return cats_dict, subcats_dict
+    cats_dict = {}     # Nombre Categoría -> id_cat_general (int)
+    subcats_dict = {}  # Nombre Subcategoría -> {"id_sub": int, "id_cat": int, "keywords": str}
+    
+    if not conn: 
+        return cats_dict, subcats_dict
+    
     try:
         cur = conn.cursor()
-        cur.execute("SELECT id_cat_general, nombre_general FROM categorias_generales ORDER BY nombre_general;")
-        for row in cur.fetchall():
-            cats_dict[row[1]] = row[0]
-
+        
+        # 1. Cargar Categorías Generales probando esquemas con COALESCE
         cur.execute("""
-            SELECT id_subcategoria, id_cat_general, nombre_subcategoria, COALESCE(palabras_clave, '') 
+            SELECT id_cat_general, nombre_general as nombre 
+            FROM categorias_generales 
+            ORDER BY nombre;
+        """)
+        for row in cur.fetchall():
+            if row[0] is not None and row[1]:
+                id_cat = int(row[0])
+                nombre_cat = str(row[1]).strip()
+                cats_dict[nombre_cat] = id_cat
+
+        # 2. Cargar Subcategorías
+        cur.execute("""
+            SELECT 
+                id_subcategoria, 
+                id_cat_general, 
+                nombre_subcategoria, 
+                COALESCE(descripcion, '') 
             FROM subcategorias 
             ORDER BY nombre_subcategoria;
         """)
         for row in cur.fetchall():
-            subcats_dict[row[2]] = {"id_sub": row[0], "id_cat": row[1], "keywords": row[3]}
+            if row[0] is not None and row[1] is not None and row[2]:
+                id_sub = int(row[0])
+                id_cat = int(row[1])
+                nombre_sub = str(row[2]).strip()
+                keywords = str(row[3]).strip()
+                
+                subcats_dict[nombre_sub] = {
+                    "id_sub": id_sub, 
+                    "id_cat": id_cat, 
+                    "keywords": keywords
+                }
         
         cur.close()
         conn.close()
     except Exception as e:
-        print(f"Error cargando catálogos: {e}")
-        if conn: conn.close()
+        print(f"❌ Error cargando catálogos en Dashboard: {e}")
+        if conn: 
+            conn.close()
+            
     return cats_dict, subcats_dict
 
 def load_reclamos():
-    """Carga los reclamos procesando coordenadas limpias de PostGIS o datos legacy."""
+    """Carga los reclamos procesando coordenadas limpias y trayendo los nombres oficiales de categorías."""
     conn = get_conn()
     if not conn: return pd.DataFrame()
     query = """
@@ -131,8 +161,8 @@ def load_reclamos():
             COALESCE(r.barrio_extraido, 'Avellaneda Centro') as barrio,
             r.id_cat_general,
             r.id_subcategoria,
-            COALESCE(cg.nombre_general, 'Sin Categorizar') as categoria,
-            COALESCE(sc.nombre_subcategoria, 'Sin Subcategoría') as subcategoria,
+            COALESCE(TRIM(cg.nombre_general), 'Sin Categorizar') as categoria,
+            COALESCE(TRIM(sc.nombre_subcategoria), 'Sin Subcategoría') as subcategoria,
             UPPER(COALESCE(r.urgencia, 'MEDIA')) as urgencia,
             COALESCE(r.precision_geocoding, 'Sin Geolocalizar') as precision_geocoding,
             CASE 
@@ -246,11 +276,11 @@ def guardar_subcategoria(id_sub, id_cat, nombre_sub, palabras_clave):
 def eliminar_reclamo_transaccional(id_reclamo, operador, motivo_baja):
     conn = get_conn()
     if not conn: return False
-    
+
     sql_crear_tabla = """
         CREATE TABLE IF NOT EXISTS public.reclamos_eliminados (
             id_eliminado SERIAL PRIMARY KEY,
-            id_reclamo INT,
+            id_reclamo UUID,  
             codigo_seguimiento VARCHAR(50),
             remoto_jid VARCHAR(100),
             texto_original TEXT,
@@ -260,6 +290,7 @@ def eliminar_reclamo_transaccional(id_reclamo, operador, motivo_baja):
             datos_completos_json JSONB
         );
     """
+
     sql_copiar = """
         INSERT INTO public.reclamos_eliminados (id_reclamo, codigo_seguimiento, remoto_jid, texto_original, motivo_eliminacion, operador, datos_completos_json)
         SELECT id_reclamo, codigo_seguimiento, remoto_jid, texto_original, %s, %s, row_to_json(r)
@@ -316,11 +347,21 @@ c4.metric("Resueltos", res)
 
 st.markdown("---")
 
-tab_mapa, tab_revision, tab_tabla, tab_config, tab_inbox = st.tabs([
-    "🗺️ Mapa Interactivo", "🚨 Bandeja de Revisión", "📋 Tabla General & Edición", "⚙️ CRUD Subcategorías", "📊 Telemetría Inbox"
-])
+# Si no hay pestaña guardada, arranca en Revisión
+if "pestana_activa" not in st.session_state:
+    st.session_state.pestana_activa = "🗺 Mapa Interactivo"
 
-with tab_mapa:
+pestana = st.segmented_control(
+    "Seleccionar Pestaña",
+    ["🗺 Mapa Interactivo", "🚨 Bandeja de Revisión", "📋 Tabla General & Edición", "⚙️ CRUD Subcategorías", "📊 Telemetría Inbox"],
+    default=st.session_state.pestana_activa,
+    key="nav_pestanas"
+)
+# Guardamos la elección para que sobreviva al rerun
+st.session_state.pestana_activa = pestana
+
+
+if st.session_state.pestana_activa == "🗺 Mapa Interactivo":
     if df.empty:
         st.info("Sin datos para mostrar.")
     elif HAS_FOLIUM:
@@ -361,9 +402,12 @@ with tab_mapa:
         if marcadores_agregados == 0:
             st.warning("⚠️ Hay reclamos registrados pero ninguno posee coordenadas geográficas válidas para mostrar en el mapa.")
 
-with tab_revision:
+if st.session_state.pestana_activa == "🚨 Bandeja de Revisión":
     st.markdown("### 🚨 Reclamos Pendientes de Revisión")
-    df_pendientes = df_raw[df_raw['estado'] == 'PENDIENTE_REVISION']
+    if not df_raw.empty and 'estado' in df_raw.columns:
+        df_pendientes = df_raw[df_raw['estado'] == 'PENDIENTE_REVISION']
+    else:
+        df_pendientes = pd.DataFrame()
     
     if df_pendientes.empty:
         st.success("🎉 ¡No hay reclamos pendientes de revisión!")
@@ -378,7 +422,7 @@ with tab_revision:
                 with c_inf:
                     st.markdown("**Multimedia / Mensaje Original:**")
                     texto_actual = row['texto_transcripto'] or row['texto_original'] or ""
-                    motivo_editado = st.text_area("Motivo / Descripción del Reclamo", value=texto_actual, key=f"motivo_{rec_id}", height=100)
+                    motivo_editado = st.text_area("Motivo / Descripción del Reclamo", value=texto_actual, key=f"rev_motivo_{rec_id}", height=100)
                 
                 with c_med:
                     url_audio = row.get('url_audio')
@@ -392,56 +436,159 @@ with tab_revision:
                         if i_path.exists(): st.image(str(i_path), width='stretch')
 
                 with c_act:
-                    nueva_dir = st.text_input("Dirección Corregida", value=row['direccion'], key=f"dir_{rec_id}")
+                    nueva_dir = st.text_input("Dirección Corregida", value=row['direccion'], key=f"rev_dir_{rec_id}")
                     idx_barrio = BARRIOS_AVELLANEDA.index(row['barrio']) if row['barrio'] in BARRIOS_AVELLANEDA else 0
-                    nuevo_barrio = st.selectbox("Barrio", BARRIOS_AVELLANEDA, index=idx_barrio, key=f"barrio_{rec_id}")
+                    nuevo_barrio = st.selectbox("Barrio", BARRIOS_AVELLANEDA, index=idx_barrio, key=f"rev_barrio_{rec_id}")
                     
+                    # --- FILTRADO REACTIVO DE CATEGORÍAS / SUBCATEGORÍAS ---
                     lista_cats = list(cats_dict.keys()) if cats_dict else ["Sin Categorizar"]
-                    cat_sel = st.selectbox("Categoría General", lista_cats, key=f"cat_{rec_id}")
-                    
+                    idx_cat_def = lista_cats.index(row['categoria']) if row['categoria'] in lista_cats else 0
+
+                    cat_sel = st.selectbox("Categoría General", lista_cats, index=idx_cat_def, key=f"rev_cat_{rec_id}")
                     id_cat_elegida = cats_dict.get(cat_sel)
-                    lista_subcats = [s for s, info in subcats_dict.items() if info["id_cat"] == id_cat_elegida] if id_cat_elegida else ["Sin Subcategoría"]
-                    if not lista_subcats: lista_subcats = ["Sin Subcategoría"]
-                    
-                    subcat_sel = st.selectbox("Subcategoría", lista_subcats, key=f"subcat_{rec_id}")
+
+                    if id_cat_elegida is not None:
+                        lista_subcats = [
+                            nombre_sub 
+                            for nombre_sub, info in subcats_dict.items() 
+                            if int(info["id_cat"]) == int(id_cat_elegida)
+                        ]
+                    else:
+                        lista_subcats = []
+
+                    if not lista_subcats:
+                        lista_subcats = ["Sin Subcategoría"]
+
+                    idx_sub_def = lista_subcats.index(row['subcategoria']) if row['subcategoria'] in lista_subcats else 0
+
+                    subcat_sel = st.selectbox("Subcategoría", lista_subcats, index=idx_sub_def, key=f"rev_subcat_{rec_id}")
                     id_subcat_elegida = subcats_dict.get(subcat_sel, {}).get("id_sub")
 
                     col_btn1, col_btn2 = st.columns(2)
                     with col_btn1:
-                        if st.button("✅ Validar y Enviar", type="primary", key=f"btn_validar_{rec_id}"):
+                        if st.button("✅ Validar y Enviar", type="primary", key=f"rev_btn_validar_{rec_id}"):
                             if actualizar_reclamo_operador(rec_id, "INGRESADO", nueva_dir, nuevo_barrio, motivo_editado, id_cat_elegida, id_subcat_elegida):
                                 st.success("Reclamo validado y geocodificado con éxito.")
                                 st.rerun()
 
                     with col_btn2:
-                        if st.button("🗑️ Eliminar Reclamo", key=f"btn_del_init_{rec_id}"):
+                        if st.button("🗑️ Eliminar Reclamo", key=f"rev_btn_del_init_{rec_id}"):
                             st.session_state[f"confirm_delete_{rec_id}"] = True
-                            st.rerun()
+#                            st.rerun()
 
             if st.session_state.get(f"confirm_delete_{rec_id}", False):
                 st.warning(f"⚠️ **¿Confirmas la eliminación del reclamo `{row['codigo_seguimiento']}`?**")
-                motivo_baja = st.text_input("Motivo de baja / desestimación", value="Duplicado / Desestimado", key=f"txt_baja_{rec_id}")
+                motivo_baja = st.text_input("Motivo de baja / desestimación", value="Duplicado / Desestimado", key=f"rev_txt_baja_{rec_id}")
                 c_si, c_no = st.columns([1, 4])
                 with c_si:
-                    if st.button("Confirmar Borrado", type="primary", key=f"btn_del_yes_{rec_id}"):
+                    if st.button("Confirmar Borrado", type="primary", key=f"rev_btn_del_yes_{rec_id}"):
                         if eliminar_reclamo_transaccional(rec_id, "Operador Dashboard", motivo_baja):
                             st.session_state[f"confirm_delete_{rec_id}"] = False
                             st.success("Reclamo auditado y borrado correctamente.")
                             st.rerun()
                 with c_no:
-                    if st.button("Cancelar", key=f"btn_del_no_{rec_id}"):
+                    if st.button("Cancelar", key=f"rev_btn_del_no_{rec_id}"):
                         st.session_state[f"confirm_delete_{rec_id}"] = False
-                        st.rerun()
+#                        st.rerun()
 
             st.markdown("---")
 
-with tab_tabla:
+if st.session_state.pestana_activa == "📋 Tabla General & Edición":
     st.markdown("### 📋 Registro General de Reclamos")
-    st.dataframe(
-        df[["codigo_seguimiento", "fecha", "urgencia", "categoria", "subcategoria", "texto_transcripto", "direccion", "barrio", "estado"]], 
-        width='stretch'
-    )
     
+    # 1. TABLA GENERAL RESUMIDA
+    st.dataframe(
+        df[[
+            "codigo_seguimiento", 
+            "fecha", 
+            "urgencia", 
+            "categoria", 
+            "subcategoria", 
+            "texto_transcripto", 
+            "direccion", 
+            "barrio", 
+            "estado"
+        ]], 
+        column_config={
+            "codigo_seguimiento": st.column_config.TextColumn("Código", width="medium"),
+            "fecha": st.column_config.DatetimeColumn("Fecha", format="DD/MM/YYYY HH:mm", width="small"),
+            "urgencia": st.column_config.TextColumn("Urgencia", width="small"),
+            "categoria": st.column_config.TextColumn("Categoría", width="medium"),
+            "subcategoria": st.column_config.TextColumn("Subcategoría", width="medium"),
+            "texto_transcripto": st.column_config.TextColumn("Texto Transcripto / Transcripción", width="large"),
+            "direccion": st.column_config.TextColumn("Dirección", width="medium"),
+            "barrio": st.column_config.TextColumn("Barrio", width="small"),
+            "estado": st.column_config.TextColumn("Estado", width="small")
+        },
+        use_container_width=True,
+#        width=True,
+        hide_index=True
+    )
+
+    st.markdown("---")
+    # 2. FEED DETALLADO EN 2 LÍNEAS POR RECLAMO
+    st.markdown("### 🎙️ Detalle de Reclamos y Contenido Multimedia")
+    st.caption("Cada reclamo se presenta estructurado en 2 líneas: Metadatos principales y Contenido (Audio/Imagen/Texto).")
+
+    if df.empty:
+        st.info("No hay reclamos registrados para mostrar.")
+    else:
+        for idx, row in df.iterrows():
+            with st.container():
+                # LÍNEA 1: Cabecera con datos del reclamo
+                c_head1, c_head2, c_head3, c_head4 = st.columns([2, 3, 3, 2])
+                with c_head1:
+                    st.markdown(f"📌 **`{row['codigo_seguimiento']}`**")
+                    st.caption(f"📅 {row['fecha']}")
+                with c_head2:
+                    st.markdown(f"🏢 **{row['categoria']}**")
+                    st.caption(f"📁 Subcat: {row['subcategoria']}")
+                with c_head3:
+                    st.markdown(f"📍 **{row['direccion']}**")
+                    st.caption(f"🏡 Barrio: {row['barrio']}")
+                with c_head4:
+                    st.markdown(f"🚨 Urgencia: **{row['urgencia']}**")
+                    st.caption(f"⚙️ Estado: **{row['estado']}**")
+
+                # LÍNEA 2: Contenido Integrado (Audio / Imagen / Texto)
+                c_media, c_texto = st.columns([1, 2])
+                
+                with c_media:
+                    # Caso A: Tiene Audio
+                    url_audio = row.get("url_audio")
+                    tiene_audio = pd.notna(url_audio) and str(url_audio).strip() != ""
+                    if tiene_audio:
+                        a_path = PROCESADOS_DIR / str(url_audio).strip()
+                        if a_path.exists():
+                            st.audio(str(a_path))
+                        else:
+                            st.warning(" Audio no encontrado en procesados")
+
+                    # Caso B: Tiene Foto
+                    url_foto = row.get("url_foto")
+                    tiene_foto = pd.notna(url_foto) and str(url_foto).strip() != ""
+                    if tiene_foto:
+                        f_path = PROCESADOS_DIR / str(url_foto).strip()
+                        if f_path.exists():
+                            st.image(str(f_path), caption="Foto Adjunta", width=200)
+                        else:
+                            st.caption(f"🖼️ Foto: {url_foto}")
+
+                    if not tiene_audio and not tiene_foto:
+                        st.caption("📝 Mensaje de Texto Directo (Sin multimedia adjunta)")
+
+                with c_texto:
+                    contenido_texto = row['texto_transcripto'] or row['texto_original'] or "Sin texto disponible"
+                    st.text_area(
+                        "Transcripción / Contenido del mensaje",
+                        value=contenido_texto,
+                        height=80,
+                        disabled=True,
+                        key=f"feed_txt_{row['id_reclamo']}_{idx}"
+                    )
+
+                st.markdown("<hr style='margin: 8px 0; border: 0.5px solid #e6e6e6;'>", unsafe_allow_html=True)
+
     st.markdown("---")
     st.markdown("### ✏️ Re-Edición de Reclamos Ingresados")
     
@@ -455,34 +602,85 @@ with tab_tabla:
         if seleccion_label:
             id_edit = opciones_reclamos[seleccion_label]
             row_edit = df_ingresados[df_ingresados['id_reclamo'] == id_edit].iloc[0]
+            rec_id = row_edit['id_reclamo']
             
-            with st.form(key=f"form_edit_ingresado_{id_edit}"):
-                c1, c2 = st.columns(2)
-                with c1:
-                    e_dir = st.text_input("Dirección", value=row_edit['direccion'])
-                    idx_b = BARRIOS_AVELLANEDA.index(row_edit['barrio']) if row_edit['barrio'] in BARRIOS_AVELLANEDA else 0
-                    e_barrio = st.selectbox("Barrio", BARRIOS_AVELLANEDA, index=idx_b)
-                    e_motivo = st.text_area("Motivo / Descripción", value=row_edit['texto_transcripto'] or row_edit['texto_original'] or "")
+            c1, c2 = st.columns(2)
+            with c1:
+                e_dir = st.text_input("Dirección", value=row_edit['direccion'], key=f"ed_dir_{id_edit}")
+                idx_b = BARRIOS_AVELLANEDA.index(row_edit['barrio']) if row_edit['barrio'] in BARRIOS_AVELLANEDA else 0
+                e_barrio = st.selectbox("Barrio", BARRIOS_AVELLANEDA, index=idx_b, key=f"ed_barrio_{id_edit}")
+                e_motivo = st.text_area("Motivo / Descripción", value=row_edit['texto_transcripto'] or row_edit['texto_original'] or "", key=f"ed_motivo_{id_edit}")
+            
+            with c2:
+                lista_cats = list(cats_dict.keys()) if cats_dict else ["Sin Categorizar"]
+                idx_cat_curr = lista_cats.index(row_edit['categoria']) if row_edit['categoria'] in lista_cats else 0
                 
-                with c2:
-                    lista_cats = list(cats_dict.keys()) if cats_dict else ["Sin Categorizar"]
-                    idx_cat_curr = lista_cats.index(row_edit['categoria']) if row_edit['categoria'] in lista_cats else 0
-                    e_cat = st.selectbox("Categoría General", lista_cats, index=idx_cat_curr)
-                    
-                    id_c_el = cats_dict.get(e_cat)
-                    lista_subs = [s for s, info in subcats_dict.items() if info["id_cat"] == id_c_el] if id_c_el else ["Sin Subcategoría"]
-                    if not lista_subs: lista_subs = ["Sin Subcategoría"]
-                    idx_sub_curr = lista_subs.index(row_edit['subcategoria']) if row_edit['subcategoria'] in lista_subs else 0
-                    e_subcat = st.selectbox("Subcategoría", lista_subs, index=idx_sub_curr)
-                    id_s_el = subcats_dict.get(e_subcat, {}).get("id_sub")
+                # 1. Selección de Categoría General
+                e_cat = st.selectbox("Categoría General", lista_cats, index=idx_cat_curr, key=f"ed_cat_{id_edit}")
+           
+                # 2. Obtener ID de Categoría
+                id_c_el = cats_dict.get(e_cat)
+                
+                # 3. Filtrar subcategorías asociadas
+                if id_c_el is not None:
+                    lista_subs = [
+                        nombre_sub 
+                        for nombre_sub, info in subcats_dict.items() 
+                        if int(info["id_cat"]) == int(id_c_el)
+                    ]
+                else:
+                    lista_subs = []
 
-                    sub_edit = st.form_submit_button("💾 Guardar Cambios y Re-Geocodificar", type="primary")
-                    if sub_edit:
-                        if actualizar_reclamo_operador(id_edit, "INGRESADO", e_dir, e_barrio, e_motivo, id_c_el, id_s_el, estado_anterior="INGRESADO"):
+                if not lista_subs: 
+                    lista_subs = ["Sin Subcategoría"]
+                
+                idx_sub_curr = lista_subs.index(row_edit['subcategoria']) if row_edit['subcategoria'] in lista_subs else 0
+                e_subcat = st.selectbox("Subcategoría", lista_subs, index=idx_sub_curr, key=f"ed_subcat_{id_edit}")
+                
+                # 4. Obtener ID de Subcategoría
+                id_s_el = subcats_dict.get(e_subcat, {}).get("id_sub")
+
+
+                col_btn1, col_btn2 = st.columns(2)
+                with col_btn1:
+
+                    # 5. Botón de guardado con referencias explícitas
+                    if st.button("💾 Guardar Cambios y Re-Geocodificar", type="primary", key=f"ed_btn_save_{id_edit}"):
+                        if actualizar_reclamo_operador(
+                            id_reclamo=id_edit, 
+                            estado_nuevo="INGRESADO", 
+                            direccion_nueva=e_dir, 
+                            barrio_nuevo=e_barrio, 
+                            motivo_nuevo=e_motivo, 
+                            id_cat=id_c_el, 
+                            id_subcat=id_s_el, 
+                            estado_anterior="INGRESADO"
+                        ):
                             st.success("Reclamo actualizado y geocodificado correctamente.")
                             st.rerun()
 
-with tab_config:
+                    with col_btn2:
+                        if st.button("🗑️ Eliminar Reclamo", key=f"rev_btn_del_init_{rec_id}"):
+                            st.session_state[f"confirm_delete_{rec_id}"] = True
+#                            st.rerun()
+
+            if st.session_state.get(f"confirm_delete_{rec_id}", False):
+                st.warning(f"⚠️ **¿Confirmas la eliminación del reclamo `{row_edit['codigo_seguimiento']}`?**")
+                motivo_baja = st.text_input("Motivo de baja / desestimación", value="Duplicado / Desestimado", key=f"rev_txt_baja_{rec_id}")
+                c_si, c_no = st.columns([1, 4])
+                with c_si:
+                    if st.button("Confirmar Borrado", type="primary", key=f"rev_btn_del_yes_{rec_id}"):
+                        if eliminar_reclamo_transaccional(rec_id, "Operador Dashboard", motivo_baja):
+                            st.session_state[f"confirm_delete_{rec_id}"] = False
+                            st.success("Reclamo auditado y borrado correctamente.")
+                            st.rerun()
+                with c_no:
+                    if st.button("Cancelar", key=f"rev_btn_del_no_{rec_id}"):
+                        st.session_state[f"confirm_delete_{rec_id}"] = False
+#                        st.rerun()
+
+
+if st.session_state.pestana_activa == "⚙️ CRUD Subcategorías":
     st.markdown("### ⚙️ CRUD de Subcategorías y Vocabulario Vecinal")
     st.caption("Gestiona las subcategorías y sus palabras clave del lenguaje cotidiano para calibrar la extracción de Ollama.")
     
@@ -535,7 +733,7 @@ with tab_config:
                 else:
                     st.error("El nombre de la subcategoría no puede estar vacío.")
 
-with tab_inbox:
+if st.session_state.pestana_activa == "📊 Telemetría Inbox":
     st.markdown("### 📊 Telemetría de Servicios e Ingesta")
     conn_tel = get_conn()
     if conn_tel:

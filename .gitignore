@@ -28,7 +28,4 @@ package.json
 package-lock.json
 node_modules/
 whatsapp_inbox/
-scr/Crud_Subcategorias_V2.py
-scr/Validar_Nomenclador.py
-ejemplo.py
 monitor.pid
