@@ -12,12 +12,14 @@ Cumple con especificaciones PEP 8 y buenas prácticas de auditoría.
 
 import argparse
 import datetime
+import difflib
 import hashlib
 import json
 import os
 import re
 import sys
 import time
+import unicodedata
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -39,10 +41,13 @@ PROCESADOS_DIR = INBOX_DIR / "procesados"
 INBOX_DIR.mkdir(parents=True, exist_ok=True)
 PROCESADOS_DIR.mkdir(parents=True, exist_ok=True)
 
-# Configuración de Nominatim para Avellaneda
-AVELLANEDA_VIEWBOX = "-58.38,-34.72,-58.30,-34.64"
+# Nominatim espera el viewbox como izquierda, arriba, derecha, abajo.
+AVELLANEDA_VIEWBOX = "-58.45,-34.60,-58.23,-34.73"
+AVELLANEDA_BOUNDS = (-58.45, -34.73, -58.23, -34.60)
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+NOMINATIM_REVERSE_URL = "https://nominatim.openstreetmap.org/reverse"
 USER_AGENT = "MuniIA_MVP_Avellaneda/2.0 (contacto_muniia@avellaneda.gob.ar)"
+_ULTIMA_CONSULTA_NOMINATIM = 0.0
 
 # --- CONFIGURACIÓN DE CONEXIÓN A BASE DE DATOS ---
 DB_PASS = os.getenv("DB_PASS")
@@ -128,32 +133,105 @@ def leer_metadata(meta_path: Path) -> Tuple[Optional[str], str]:
 
 
 def get_barrio_postgis(conn: psycopg2.extensions.connection, lat: Optional[float], lon: Optional[float]) -> str:
-    """Determina el barrio realizando una consulta espacial ST_Contains sobre barrios_avellaneda."""
+    """Determina el barrio por ubicación; no inventa uno si faltan coordenadas."""
     if lat is None or lon is None:
-        return "Avellaneda Centro"
+        return "A confirmar"
 
     try:
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT nombre 
-                FROM barrios_avellaneda
-                WHERE ST_Contains(geom, ST_SetSRID(ST_MakePoint(%s, %s), 4326))
+                FROM public.barrios_avellaneda
+                WHERE ST_Covers(geom, ST_SetSRID(ST_MakePoint(%s, %s), 4326))
+                ORDER BY ST_Area(geom) ASC
                 LIMIT 1
             """, (lon, lat))
             row = cur.fetchone()
             if row and row[0]:
                 return row[0]
             else:
-                return "Avellaneda Centro"
+                return "A confirmar"
     except Exception as e:
         print(f"⚠️ [ERROR] Barrio PostGIS: {e}")
-        return "Sarandí"
+        conn.rollback()
+        return "A confirmar"
 
 
-def geocodificar_nominatim(direccion_texto: str) -> Tuple[Optional[float], Optional[float], str]:
-    """Geocodifica una dirección en Nominatim (OSM) delimitada a Avellaneda."""
+def _esperar_nominatim() -> None:
+    """Respeta el límite de una solicitud por segundo del servicio público."""
+    global _ULTIMA_CONSULTA_NOMINATIM
+    espera = 1.0 - (time.monotonic() - _ULTIMA_CONSULTA_NOMINATIM)
+    if espera > 0:
+        time.sleep(espera)
+    _ULTIMA_CONSULTA_NOMINATIM = time.monotonic()
+
+
+def _es_localidad_de_avellaneda(address: Dict[str, Any]) -> bool:
+    localidades = (
+        address.get(key, "")
+        for key in ("municipality", "county", "city", "town", "city_district", "suburb")
+    )
+    return any(
+        isinstance(localidad, str) and "avellaneda" in localidad.lower()
+        for localidad in localidades
+    )
+
+
+def _extraer_barrio_de_address(address: Dict[str, Any]) -> Optional[str]:
+    for key in ("neighbourhood", "suburb", "borough", "city_district"):
+        localidad = address.get(key)
+        if (
+            isinstance(localidad, str)
+            and localidad.strip()
+            and localidad.strip().lower() not in {
+                "avellaneda", "partido de avellaneda", "municipio de avellaneda"
+            }
+        ):
+            return localidad.strip()
+    return None
+
+
+def geocodificar_barrio_nominatim(lat: float, lon: float) -> Optional[str]:
+    """Busca el barrio de un punto con geocodificación inversa de Nominatim."""
+    params = {
+        "lat": lat,
+        "lon": lon,
+        "format": "jsonv2",
+        "zoom": 17,
+        "addressdetails": 1,
+    }
+    url = f"{NOMINATIM_REVERSE_URL}?{urllib.parse.urlencode(params)}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept-Language": "es-AR,es;q=0.9",
+        },
+    )
+
+    _esperar_nominatim()
+    try:
+        with urllib.request.urlopen(req, timeout=5) as response:
+            if response.status != 200:
+                return None
+            data = json.loads(response.read().decode("utf-8"))
+            address = data.get("address") or {}
+            if not _es_localidad_de_avellaneda(address):
+                return None
+            return _extraer_barrio_de_address(address)
+    except Exception as err:
+        print(f"⚠️ Error al consultar barrio en Nominatim: {err}")
+        return None
+
+
+def geocodificar_nominatim(
+    direccion_texto: str
+) -> Tuple[Optional[float], Optional[float], str, Optional[str]]:
+    """Geocodifica una dirección y acepta solo resultados identificados como Avellaneda."""
+    global _ULTIMA_CONSULTA_NOMINATIM
+
     if not direccion_texto or "a confirmar" in direccion_texto.lower():
-        return None, None, "Sin Geolocalizar"
+        return None, None, "Sin Geolocalizar", None
 
     query = f"{direccion_texto}, Avellaneda, Buenos Aires, Argentina"
     params = {
@@ -161,40 +239,63 @@ def geocodificar_nominatim(direccion_texto: str) -> Tuple[Optional[float], Optio
         "format": "jsonv2",
         "bounded": 1,
         "viewbox": AVELLANEDA_VIEWBOX,
-        "limit": 1,
+        "limit": 5,
         "countrycodes": "ar",
         "addressdetails": 1
     }
-    
+
     url = f"{NOMINATIM_URL}?{urllib.parse.urlencode(params)}"
     headers = {
         "User-Agent": USER_AGENT,
         "Accept-Language": "es-AR,es;q=0.9"
     }
     req = urllib.request.Request(url, headers=headers)
+    resultado = None
 
+    _esperar_nominatim()
     try:
         with urllib.request.urlopen(req, timeout=5) as response:
             if response.status == 200:
                 data = json.loads(response.read().decode("utf-8"))
-                if data and len(data) > 0:
-                    item = data[0]
+                for item in data:
                     lat = float(item["lat"])
                     lon = float(item["lon"])
-                    importance = float(item.get("importance", 0))
-                    
-                    precision = "Dirección con Altura" if importance >= 0.3 else "Aproximada"
-                    return lat, lon, precision
+                    min_lon, min_lat, max_lon, max_lat = AVELLANEDA_BOUNDS
+                    if not (min_lon <= lon <= max_lon and min_lat <= lat <= max_lat):
+                        continue
+
+                    address = item.get("address") or {}
+                    if not _es_localidad_de_avellaneda(address):
+                        continue
+
+                    precision = (
+                        "Dirección con Altura"
+                        if address.get("house_number")
+                        else "Aproximada"
+                    )
+                    resultado = (
+                        lat,
+                        lon,
+                        precision,
+                        _extraer_barrio_de_address(address),
+                    )
+                    break
     except Exception as err:
         print(f"⚠️ Error al consultar Nominatim OSM: {err}")
 
-    return None, None, "Sin Geolocalizar"
+    if resultado:
+        lat, lon, precision, barrio = resultado
+        if not barrio:
+            barrio = geocodificar_barrio_nominatim(lat, lon)
+        return lat, lon, precision, barrio
+
+    return None, None, "Sin Geolocalizar", None
 
 
 def obtener_o_crear_ciudadano_hash(
     conn: psycopg2.extensions.connection,
     telefono_o_id: Optional[str],
-    barrio: str = "Sarandí"
+    barrio: str = "A confirmar"
 ) -> str:
     """Genera hash SHA-256 del JID/Teléfono para anonimizar la identidad del vecino."""
     tz_arg = ZoneInfo("America/Argentina/Buenos_Aires")
@@ -216,7 +317,7 @@ def obtener_o_crear_ciudadano_hash(
                 """
                 UPDATE ciudadanos_anonimizados 
                 SET cantidad_reclamos = cantidad_reclamos + 1,
-                    barrio_inferido = COALESCE(%s, barrio_inferido)
+                    barrio_inferido = COALESCE(NULLIF(%s, 'A confirmar'), barrio_inferido)
                 WHERE id_ciudadano_hash = %s
                 """,
                 (barrio, hash_ciudadano)
@@ -234,186 +335,306 @@ def obtener_o_crear_ciudadano_hash(
     return hash_ciudadano
 
 
-def resolver_calle_exacta_db(conn: psycopg2.extensions.connection, palabra: str) -> Optional[str]:
-    """Valida un token o nombre contra la base de datos completa de calles_avellaneda."""
-    if not palabra or len(palabra.strip()) < 3:
-        return None
-
+def _candidatos_calle(tokens: list, desde_final: bool) -> list:
+    """Genera frases cortas contiguas para buscar nombres de calles cerca de un marcador."""
     ignorar = {
-        "calle", "avenida", "av", "esquina", "esq", "entre", "cerca", "es", "para", 
-        "hacer", "reclamo", "denuncia", "choque", "accidente", "sobre", "gracias", 
-        "buenas", "tardes", "dias", "noches", "funciona", "unciona", "semaforo", "semáforo"
+        "al", "altura", "avenida", "av", "calle", "con", "esquina", "nro", "numero",
+        "número", "por", "sobre",
     }
-    
-    if palabra.lower().strip() in ignorar:
+    palabras = list(tokens)
+    while palabras and palabras[0].lower() in ignorar:
+        palabras.pop(0)
+    while palabras and palabras[-1].lower() in ignorar:
+        palabras.pop()
+    if desde_final:
+        palabras = palabras[-5:]
+    else:
+        palabras = palabras[:5]
+
+    candidatos = []
+    for cantidad in range(1, len(palabras) + 1):
+        frase = (
+            palabras[-cantidad:] if desde_final else palabras[:cantidad]
+        )
+        candidato = " ".join(frase).strip()
+        if len(candidato) >= 3:
+            candidatos.append(candidato)
+    return candidatos
+
+
+def _resolver_calle_db(
+    conn: psycopg2.extensions.connection,
+    candidatos: list
+) -> Optional[str]:
+    """Busca la mejor coincidencia de las frases candidatas en el callejero municipal."""
+    candidatos = list(dict.fromkeys(candidatos))
+    if not candidatos:
         return None
 
     query = """
-        SELECT nombre, similarity(LOWER(nombre), LOWER(%s)) as sim
-        FROM public.calles_avellaneda
-        WHERE similarity(LOWER(nombre), LOWER(%s)) > 0.40
-        ORDER BY sim DESC
-        LIMIT 1;
+        SELECT candidatos.orden, coincidencia.nombre, coincidencia.similitud
+        FROM unnest(%s::text[]) WITH ORDINALITY AS candidatos(frase, orden)
+        CROSS JOIN LATERAL (
+            SELECT nombre, similarity(LOWER(nombre), LOWER(candidatos.frase)) AS similitud
+            FROM public.calles_avellaneda
+            WHERE similarity(LOWER(nombre), LOWER(candidatos.frase)) >= 0.45
+            ORDER BY similitud DESC
+            LIMIT 1
+        ) AS coincidencia
+        ORDER BY coincidencia.similitud DESC, LENGTH(candidatos.frase) DESC
+        LIMIT 1
     """
     try:
         with conn.cursor() as cur:
-            cur.execute(query, (palabra.strip(), palabra.strip()))
+            cur.execute(query, (candidatos,))
             row = cur.fetchone()
-            if row:
-                return row[0]
+            if row and row[2] >= 0.50:
+                return row[1]
     except Exception as err:
+        print(f"⚠️ Error buscando la calle en el callejero: {err}")
         conn.rollback()
-
     return None
 
 
 def extraer_geometria_y_barrio_gratuito(
     conn: psycopg2.extensions.connection, 
     texto: str
-) -> Tuple[str, str, float, float, str]:
+) -> Tuple[str, str, Optional[float], Optional[float], str]:
     """
-    Extrae esquinas o altura validando directamente contra la red vial completa de Avellaneda.
+    Extrae esquinas o altura contrastando frases completas con el callejero municipal.
     """
     direccion_limpia = "Avellaneda (Dirección a confirmar)"
-    lat, lon = -34.6865, -58.3486
+    lat, lon = None, None
     precision = "Sin Geolocalizar"
 
     if not texto or len(texto.strip()) < 5:
         barrio_detectado = get_barrio_postgis(conn, lat, lon)
         return direccion_limpia, barrio_detectado, lat, lon, precision
 
-    tokens = re.findall(r"\b\w+\b", texto)
+    tokens = re.findall(r"\b[\w]+\b", texto, flags=re.UNICODE)
 
     # --- CASO A: DETECCIÓN DE ESQUINAS E INTERSECCIONES ---
     for i, token in enumerate(tokens):
         if token.lower() in ["y", "esq", "esquina"] and 0 < i < len(tokens) - 1:
-            c1_cand = tokens[i - 1]
-            calle_1 = resolver_calle_exacta_db(conn, c1_cand)
-            if not calle_1 and i - 2 >= 0:
-                calle_1 = resolver_calle_exacta_db(conn, f"{tokens[i-2]} {tokens[i-1]}")
-
-            c2_cand = tokens[i + 1]
-            calle_2 = resolver_calle_exacta_db(conn, c2_cand)
-            if not calle_2 and i + 2 < len(tokens):
-                calle_2 = resolver_calle_exacta_db(conn, f"{tokens[i+1]} {tokens[i+2]}")
+            candidatos_1 = _candidatos_calle(tokens[:i], desde_final=True)
+            candidatos_2 = _candidatos_calle(tokens[i + 1:], desde_final=False)
+            calle_1 = _resolver_calle_db(conn, candidatos_1)
+            calle_2 = _resolver_calle_db(conn, candidatos_2)
 
             if calle_1 and calle_2:
                 direccion_limpia = f"{calle_1} y {calle_2}"
-                lat_osm, lon_osm, prec_osm = geocodificar_nominatim(f"{calle_1} y {calle_2}")
-                if lat_osm and lon_osm:
+                lat_osm, lon_osm, _, barrio_osm = geocodificar_nominatim(direccion_limpia)
+                if lat_osm is not None and lon_osm is not None:
                     lat, lon, precision = lat_osm, lon_osm, "Esquina / Intersección"
-                else:
-                    lat_c, lon_c, _ = geocodificar_nominatim(calle_1)
-                    if lat_c and lon_c:
-                        lat, lon, precision = lat_c, lon_c, "Aproximada"
 
-                barrio_detectado = get_barrio_postgis(conn, lat, lon)
+                barrio_detectado = barrio_osm or get_barrio_postgis(conn, lat, lon)
                 return direccion_limpia, barrio_detectado, lat, lon, precision
 
     # --- CASO B: DETECCIÓN DE CALLE + ALTURA ---
     for i, token in enumerate(tokens):
         if token.isdigit() and 2 <= len(token) <= 5:
             altura = token
-            for offset in [1, 2, 3]:
-                if i - offset >= 0:
-                    candidato_texto = " ".join(tokens[i - offset : i])
-                    calle_encontrada = resolver_calle_exacta_db(conn, candidato_texto)
-                    if calle_encontrada:
-                        direccion_limpia = f"{calle_encontrada} {altura}"
-                        lat_osm, lon_osm, prec_osm = geocodificar_nominatim(direccion_limpia)
-                        if lat_osm and lon_osm:
-                            lat, lon, precision = lat_osm, lon_osm, prec_osm
-                        else:
-                            lat_calle, lon_calle, _ = geocodificar_nominatim(calle_encontrada)
-                            if lat_calle and lon_calle:
-                                lat, lon, precision = lat_calle, lon_calle, "Aproximada"
-
-                        barrio_detectado = get_barrio_postgis(conn, lat, lon)
-                        return direccion_limpia, barrio_detectado, lat, lon, precision
+            candidatos = _candidatos_calle(tokens[:i], desde_final=True)
+            calle_encontrada = _resolver_calle_db(conn, candidatos)
+            if not calle_encontrada:
+                candidatos = _candidatos_calle(tokens[i + 1:], desde_final=False)
+                calle_encontrada = _resolver_calle_db(conn, candidatos)
+            if calle_encontrada:
+                direccion_limpia = f"{calle_encontrada} {altura}"
+                lat, lon, precision, barrio_osm = geocodificar_nominatim(direccion_limpia)
+                barrio_detectado = barrio_osm or get_barrio_postgis(conn, lat, lon)
+                return direccion_limpia, barrio_detectado, lat, lon, precision
 
     barrio_detectado = get_barrio_postgis(conn, lat, lon)
     return direccion_limpia, barrio_detectado, lat, lon, precision
+
+def _variantes_token_clasificacion(token: str) -> set:
+    """Normaliza acentos y variantes comunes de singular/plural en español."""
+    token = "".join(
+        caracter
+        for caracter in unicodedata.normalize("NFD", token.lower())
+        if unicodedata.category(caracter) != "Mn"
+    )
+    variantes = {token}
+    if len(token) > 4 and token.endswith("ces"):
+        variantes.add(token[:-3] + "z")
+    if len(token) > 4 and token.endswith("s"):
+        variantes.add(token[:-1])
+    if len(token) > 5 and token.endswith("es"):
+        variantes.add(token[:-2])
+    if len(token) > 5 and token.endswith(("an", "en")):
+        variantes.add(token[:-1])
+    if len(token) > 5 and token.endswith(("ado", "ada", "ido", "ida")):
+        variantes.add(token[:-1])
+    return variantes
+
+
+def _tokenizar_clasificacion(texto: str, stopwords: set) -> list:
+    tokens = []
+    for token in re.findall(r"\w+", texto.lower(), flags=re.UNICODE):
+        variantes = _variantes_token_clasificacion(token)
+        if (len(token) > 2 or token in {"no", "ni"}) and not variantes.intersection(stopwords):
+            tokens.append(variantes)
+    return tokens
+
+
+def _frases_clave(valor: Any) -> list:
+    if isinstance(valor, str):
+        return [frase.strip() for frase in re.split(r"[,;\n|]+", valor) if frase.strip()]
+    if isinstance(valor, (list, tuple, set)):
+        return [str(frase).strip() for frase in valor if str(frase).strip()]
+    return []
+
+
+def _cantidad_tokens_coincidentes(tokens_texto: list, texto_catalogo: str, stopwords: set) -> int:
+    tokens_catalogo = _tokenizar_clasificacion(texto_catalogo, stopwords)
+    unicos = {frozenset(token) for token in tokens_catalogo}
+    return sum(
+        any(_tokens_clasificacion_compatibles(token, token_texto) for token_texto in tokens_texto)
+        for token in unicos
+    )
+
+
+def _tokens_clasificacion_compatibles(token_1: set, token_2: set) -> bool:
+    if token_1.intersection(token_2):
+        return True
+    return any(
+        len(palabra_1) >= 5
+        and len(palabra_2) >= 5
+        and difflib.SequenceMatcher(None, palabra_1, palabra_2).ratio() >= 0.84
+        for palabra_1 in token_1
+        for palabra_2 in token_2
+    )
+
+
+def _frase_coincide(frase: str, tokens_texto: list, stopwords: set) -> bool:
+    tokens_frase = _tokenizar_clasificacion(frase, stopwords)
+    if not tokens_frase or len(tokens_frase) > len(tokens_texto):
+        return False
+    for inicio in range(len(tokens_texto) - len(tokens_frase) + 1):
+        if all(
+            _tokens_clasificacion_compatibles(actual, esperado)
+            for actual, esperado in zip(
+                tokens_texto[inicio:inicio + len(tokens_frase)],
+                tokens_frase
+            )
+        ):
+            return True
+    return False
+
 
 def clasificar_y_obtener_metadatos(
     conn: psycopg2.extensions.connection,
     texto: Optional[str]
 ) -> Tuple[Optional[int], Optional[int], str, Optional[int], Optional[str], Optional[str]]:
-    """
-    Clasifica el texto según coincidencia ponderada de tokens entre el mensaje
-    y el título/descripción de las subcategorías (sin palabras clave hardcodeadas).
-    """
+    """Clasifica con palabras clave y evita asignar categorías de baja confianza o ambiguas."""
     if not texto or len(texto.strip()) < 3:
+        return None, None, "MEDIA", None, None, None
+    if "imagen adjunta" in texto.lower() or "foto adjunta" in texto.lower():
         return None, None, "MEDIA", None, None, None
 
     stopwords = {
-        "para", "como", "esta", "este", "sobre", "hacer", "reclamo", "informar", 
-        "consulta", "buenas", "tardes", "dias", "noches", "favor", "necesito", 
+        "para", "como", "esta", "este", "sobre", "hacer", "reclamo", "informar",
+        "consulta", "buenas", "tardes", "dias", "noches", "favor", "necesito",
         "queria", "saber", "tener", "local", "lugar", "zona", "denuncia", "que",
-        "hubo", "hacer", "calle", "avellaneda", "gracias", "unas", "unos"
+        "hubo", "calle", "avellaneda", "gracias", "unas", "unos", "una", "uno",
+        "los", "las", "del", "por", "con", "hay", "ahi", "aca", "esta", "estan",
+        "de", "la", "el", "en", "al", "a", "y", "se", "me", "lo",
     }
+    stopwords_normalizadas = set()
+    for palabra in stopwords:
+        stopwords_normalizadas.update(_variantes_token_clasificacion(palabra))
 
-    tokens_texto = set(
-        p.lower() for p in re.split(r"\W+", texto) 
-        if len(p) > 2 and p.lower() not in stopwords
-    )
-
+    tokens_texto = _tokenizar_clasificacion(texto, stopwords_normalizadas)
     if not tokens_texto:
         return None, None, "MEDIA", None, None, None
 
-    subcategoria_ganadora = None
-    max_score = 0
-
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            query = """
-                SELECT 
-                    s.id_subcategoria, 
-                    s.id_cat_general, 
-                    s.nombre_subcategoria, 
+            cur.execute("""
+                SELECT
+                    s.id_subcategoria,
+                    s.id_cat_general,
+                    s.nombre_subcategoria,
                     s.urgencia_default,
                     s.descripcion,
+                    to_jsonb(s) ->> 'palabras_clave' AS palabras_clave,
                     c.id_area_default,
                     c.nombre_general AS nombre_cat_general
                 FROM subcategorias s
-                JOIN categorias_generales c ON s.id_cat_general = c.id_cat_general
-            """
-            cur.execute(query)
+                LEFT JOIN categorias_generales c ON s.id_cat_general = c.id_cat_general
+            """)
             subcategorias = cur.fetchall()
 
-            for sub in subcategorias:
-                nombre_sub = (sub["nombre_subcategoria"] or "").lower()
-                desc_sub = (sub["descripcion"] or "").lower()
+        if not subcategorias:
+            print("⚠️ No hay subcategorías disponibles para clasificar el reclamo.")
+            return None, None, "MEDIA", None, None, None
 
-                tokens_nombre = set(p for p in re.split(r"\W+", nombre_sub) if len(p) > 2 and p not in stopwords)
-                tokens_desc = set(p for p in re.split(r"\W+", desc_sub) if len(p) > 2 and p not in stopwords)
+        puntajes = []
+        for subcategoria in subcategorias:
+            frases = _frases_clave(subcategoria.get("palabras_clave"))
+            tokens_clave = " ".join(frases)
+            coincidencias_clave = _cantidad_tokens_coincidentes(
+                tokens_texto,
+                tokens_clave,
+                stopwords_normalizadas
+            )
+            coincidencias_frase = sum(
+                _frase_coincide(frase, tokens_texto, stopwords_normalizadas)
+                for frase in frases
+            )
 
-                # Ponderación estructural pura
-                match_nombre = tokens_texto.intersection(tokens_nombre)
-                match_desc = tokens_texto.intersection(tokens_desc) - match_nombre
+            nombre = subcategoria.get("nombre_subcategoria") or ""
+            descripcion = subcategoria.get("descripcion") or ""
+            frases_descripcion = _frases_clave(descripcion)
+            coincidencias_descripcion_frase = sum(
+                _frase_coincide(frase, tokens_texto, stopwords_normalizadas)
+                for frase in frases_descripcion
+            )
 
-                score = (len(match_nombre) * 3) + len(match_desc)
+            score = (
+                min(coincidencias_clave * 2, 8)
+                + min(coincidencias_frase, 2) * 3
+                + min(_cantidad_tokens_coincidentes(
+                    tokens_texto,
+                    nombre,
+                    stopwords_normalizadas
+                ) * 3, 6)
+                + min(_cantidad_tokens_coincidentes(
+                    tokens_texto,
+                    descripcion,
+                    stopwords_normalizadas
+                ) * 2, 8)
+                + min(coincidencias_descripcion_frase, 2) * 4
+            )
+            if score:
+                puntajes.append((score, subcategoria))
 
-                if score > max_score:
-                    max_score = score
-                    subcategoria_ganadora = sub
+        puntajes.sort(key=lambda resultado: resultado[0], reverse=True)
+        if not puntajes or puntajes[0][0] < 2:
+            print("⚠️ Ninguna subcategoría del catálogo coincide con suficiente claridad.")
+            return None, None, "MEDIA", None, None, None
+        if len(puntajes) > 1 and puntajes[0][0] == puntajes[1][0]:
+            print(
+                "⚠️ Clasificación ambigua entre subcategorías: "
+                f"{puntajes[0][1].get('nombre_subcategoria')} / "
+                f"{puntajes[1][1].get('nombre_subcategoria')}."
+            )
+            return None, None, "MEDIA", None, None, None
 
-            if subcategoria_ganadora and max_score > 0:
-                urgencia = subcategoria_ganadora["urgencia_default"] or "MEDIA"
-                return (
-                    subcategoria_ganadora["id_cat_general"],
-                    subcategoria_ganadora["id_subcategoria"],
-                    urgencia.upper(),
-                    subcategoria_ganadora["id_area_default"],
-                    subcategoria_ganadora["nombre_cat_general"],
-                    subcategoria_ganadora["nombre_subcategoria"]
-                )
-
+        ganadora = puntajes[0][1]
+        urgencia = ganadora.get("urgencia_default") or "MEDIA"
+        return (
+            ganadora["id_cat_general"],
+            ganadora["id_subcategoria"],
+            urgencia.upper(),
+            ganadora.get("id_area_default"),
+            ganadora.get("nombre_cat_general"),
+            ganadora.get("nombre_subcategoria")
+        )
     except Exception as err:
         print(f"⚠️ Error durante la clasificación por scoring en BD: {err}")
-        try:
-            conn.rollback()
-        except Exception:
-            pass
+        conn.rollback()
 
     return None, None, "MEDIA", None, None, None
 
@@ -441,7 +662,12 @@ def guardar_reclamo_completo(
     id_cat_general, id_subcategoria, urgencia_bd, id_area_default, nombre_cat, nombre_sub = clasificar_y_obtener_metadatos(conn, texto_evaluar)
 
     direccion = datos.get("direccion_extraida")
-    es_direccion_valida = direccion and "a confirmar" not in direccion.lower()
+    es_direccion_valida = (
+        direccion
+        and "a confirmar" not in direccion.lower()
+        and datos.get("lat") is not None
+        and datos.get("lon") is not None
+    )
     
     if id_cat_general and id_subcategoria and es_direccion_valida:
         estado_reclamo = "INGRESADO"
@@ -473,7 +699,7 @@ def guardar_reclamo_completo(
 
     geom_sql = (
         f"ST_SetSRID(ST_MakePoint({datos['lon']}, {datos['lat']}), 4326)"
-        if datos.get("lat") and datos.get("lon")
+        if datos.get("lat") is not None and datos.get("lon") is not None
         else "NULL"
     )
 
